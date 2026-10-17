@@ -307,6 +307,327 @@ static void OnCopyObjectLengthSeconds(EDIT_SECTION* edit) {
 }
 
 //---------------------------------------------------------------------
+//---------------------------------------------------------------------
+// 文字列エンコーディング自動判定ユーティリティ (UTF-8 / CP932両対応)
+//---------------------------------------------------------------------
+static std::wstring ToWideStringAuto(const char* str) {
+    if (!str || !*str) return L"";
+    // 1. まずUTF-8として厳密に変換を試みる
+    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str, -1, nullptr, 0);
+    if (len > 0) {
+        std::vector<wchar_t> buf(len);
+        if (MultiByteToWideChar(CP_UTF8, 0, str, -1, buf.data(), len) > 0) {
+            return buf.data();
+        }
+    }
+    // 2. UTF-8で無効文字があった場合はCP932 (Shift-JIS) として変換
+    len = MultiByteToWideChar(932, 0, str, -1, nullptr, 0);
+    if (len > 0) {
+        std::vector<wchar_t> buf(len);
+        if (MultiByteToWideChar(932, 0, str, -1, buf.data(), len) > 0) {
+            return buf.data();
+        }
+    }
+    return L"";
+}
+
+//---------------------------------------------------------------------
+// 元素材（カット前）情報取得ヘルパー
+//---------------------------------------------------------------------
+struct ObjectSourceInfo {
+    bool has_source_pos = false;    // 再生位置が設定されているか
+    double play_position = 0.0;     // 再生位置 (秒数、0.000sスタート)
+    double play_speed = 100.0;      // 再生速度 (%)
+    bool has_media_file = false;    // メディアファイルがあるか
+    std::wstring file_path;         // メディアファイルパス
+    double total_time = 0.0;        // 元ファイルの総時間 (秒)
+    int total_frames = 0;           // 元ファイルの総フレーム数
+};
+
+static ObjectSourceInfo ResolveObjectSourceInfo(EDIT_SECTION* edit, OBJECT_HANDLE obj) {
+    ObjectSourceInfo info;
+    if (!edit || !obj) return info;
+
+    OBJECT_LAYER_FRAME lf = edit->get_object_layer_frame(obj);
+    int relFrame0Based = (edit->info) ? (edit->info->frame - lf.start) : 0;
+    double currentTimelineFrame = (edit->info) ? static_cast<double>(edit->info->frame) : 0.0;
+
+    static const wchar_t* TRACK_NAMES[] = {
+        L"再生位置", L"再生開始", L"開始位置", L"開始フレーム", L"位置", L"start", L"pos", L"position"
+    };
+
+    // 1. SDKの get_effect_list + get_effect_track_value による全エフェクト走査
+    if (edit->get_effect_list) {
+        int effectCount = edit->get_effect_list(obj, nullptr, 0);
+        if (effectCount > 0) {
+            std::vector<EFFECT_HANDLE> effects(effectCount);
+            edit->get_effect_list(obj, effects.data(), effectCount);
+
+            for (EFFECT_HANDLE eff : effects) {
+                if (!info.has_source_pos && edit->get_effect_track_value) {
+                    for (const wchar_t* trkName : TRACK_NAMES) {
+                        double val = 0.0;
+                        // frame引数として、0.0、相対フレーム、タイムラインフレームの3通りを順に試す
+                        if (edit->get_effect_track_value(eff, trkName, 0.0, &val) ||
+                            edit->get_effect_track_value(eff, trkName, static_cast<double>(relFrame0Based), &val) ||
+                            edit->get_effect_track_value(eff, trkName, currentTimelineFrame, &val)) {
+                            info.play_position = val;
+                            info.has_source_pos = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (edit->get_effect_track_value) {
+                    double spd = 100.0;
+                    if (edit->get_effect_track_value(eff, L"再生速度", 0.0, &spd) ||
+                        edit->get_effect_track_value(eff, L"再生速度", static_cast<double>(relFrame0Based), &spd)) {
+                        info.play_speed = spd;
+                    }
+                }
+
+                if (edit->get_effect_item_value && !info.has_media_file) {
+                    LPCSTR fStr = edit->get_effect_item_value(eff, L"file");
+                    if (fStr && strlen(fStr) > 0) {
+                        std::wstring wpath = ToWideStringAuto(fStr);
+                        if (!wpath.empty()) {
+                            info.file_path = wpath;
+                            info.has_media_file = true;
+                        }
+                    }
+                }
+
+                if (info.has_source_pos && info.has_media_file) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. フォールバック: get_object_track_value
+    if (!info.has_source_pos && edit->get_object_track_value) {
+        static const wchar_t* EFFECTS[] = { L"動画ファイル", L"音声ファイル", L"シーン", L"動画ファイル:0", L"音声ファイル:0", L"動画", L"音声" };
+        for (const wchar_t* eff : EFFECTS) {
+            for (const wchar_t* trkName : TRACK_NAMES) {
+                double val = 0.0;
+                if (edit->get_object_track_value(obj, eff, trkName, 0.0, &val) ||
+                    edit->get_object_track_value(obj, eff, trkName, static_cast<double>(relFrame0Based), &val)) {
+                    info.play_position = val;
+                    info.has_source_pos = true;
+
+                    double spd = 100.0;
+                    if (edit->get_object_track_value(obj, eff, L"再生速度", 0.0, &spd)) {
+                        info.play_speed = spd;
+                    }
+                    break;
+                }
+            }
+            if (info.has_source_pos) break;
+        }
+    }
+
+    // 3. フォールバック: エイリアス文字列 (get_object_alias) をワイド文字列化して徹底解析
+    if (!info.has_source_pos && edit->get_object_alias) {
+        LPCSTR rawAlias = edit->get_object_alias(obj);
+        if (rawAlias && strlen(rawAlias) > 0) {
+            std::wstring aliasW = ToWideStringAuto(rawAlias);
+            if (!aliasW.empty()) {
+                std::wistringstream stream(aliasW);
+                std::wstring line;
+                while (std::getline(stream, line)) {
+                    while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == L'\t')) {
+                        line.pop_back();
+                    }
+                    if (line.empty() || (line[0] == L'[' && line.back() == L']')) continue;
+
+                    size_t eq = line.find(L'=');
+                    if (eq != std::wstring::npos) {
+                        std::wstring key = line.substr(0, eq);
+                        std::wstring val = line.substr(eq + 1);
+
+                        // キー名の前後の空白を除去
+                        while (!key.empty() && (key.back() == L' ' || key.back() == L'\t')) key.pop_back();
+                        size_t kstart = key.find_first_not_of(L" \t");
+                        if (kstart != std::wstring::npos) key = key.substr(kstart);
+
+                        if (key == L"再生位置" || key == L"再生開始" || key == L"開始位置" || key == L"開始フレーム") {
+                            try {
+                                size_t comma = val.find(L',');
+                                if (comma != std::wstring::npos) val = val.substr(0, comma);
+                                info.play_position = std::stod(val);
+                                info.has_source_pos = true;
+                            } catch (...) {}
+                        } else if (key == L"再生速度") {
+                            try {
+                                size_t comma = val.find(L',');
+                                if (comma != std::wstring::npos) val = val.substr(0, comma);
+                                info.play_speed = std::stod(val);
+                            } catch (...) {}
+                        } else if (key == L"file" && !val.empty() && !info.has_media_file) {
+                            info.file_path = val;
+                            info.has_media_file = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. メディアファイルがある場合、総時間と総フレーム数を取得
+    if (info.has_media_file && !info.file_path.empty() && edit->get_media_info) {
+        MEDIA_INFO minfo = { 0 };
+        if (edit->get_media_info(info.file_path.c_str(), &minfo, sizeof(MEDIA_INFO))) {
+            info.total_time = minfo.total_time;
+            if (edit->info && edit->info->scale > 0 && edit->info->rate > 0) {
+                double fps = static_cast<double>(edit->info->rate) / static_cast<double>(edit->info->scale);
+                info.total_frames = static_cast<int>(std::round(info.total_time * fps));
+            }
+        }
+    }
+
+    return info;
+}
+
+// 8. オブジェクト基準: 絶対フレーム数 (カットが行われていないと仮定した素材基準の現在フレーム数)
+// 例: 素材A(512f)の前半310f(約10.333s)をカットした素材B(202f)の15フレーム目の場合 -> 310 + 15 = 325フレーム
+static void OnCopyObjectAbsoluteFrame(EDIT_SECTION* edit) {
+    if (!edit || !edit->info || edit->info->rate <= 0) return;
+    OBJECT_HANDLE obj = ResolveTargetObject(edit);
+    if (!obj) {
+        HWND parent = GetHostAppWindowSafe();
+        MessageBoxW(parent, L"対象のオブジェクトが見つかりませんでした。\nオブジェクトをクリックまたは選択して実行してください。", L"TimeAcquisition", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    OBJECT_LAYER_FRAME lf = edit->get_object_layer_frame(obj);
+    int relFrame0Based = edit->info->frame - lf.start;
+    double fps = static_cast<double>(edit->info->rate) / static_cast<double>(edit->info->scale);
+    ObjectSourceInfo sinfo = ResolveObjectSourceInfo(edit, obj);
+
+    // AviUtl2の再生位置は「秒数」(小数点第3位まで)。秒数にFPSを掛けてカットされた前半フレーム数を算出
+    double cutFrames = (sinfo.has_source_pos) ? (sinfo.play_position * fps) : 0.0;
+    int cutFramesInt = static_cast<int>(std::round(cutFrames));
+
+    double speed = (sinfo.play_speed != 0.0) ? (sinfo.play_speed / 100.0) : 1.0;
+    double progressInB = static_cast<double>(relFrame0Based) * speed;
+
+    // カット後オブジェクト内の現在フレーム (1始まり基準)
+    int relFrameDisplay = static_cast<int>(std::round(progressInB)) + g_config.frame_origin;
+
+    // カットを行わなかったと仮定した絶対フレーム数 = (カットされたフレーム数) + (カット後オブジェクト内の現在フレーム)
+    int finalAbsFrame = cutFramesInt + relFrameDisplay;
+
+    std::wstring text = std::to_wstring(finalAbsFrame);
+    CopyToClipboard(text);
+
+    // 通知メッセージ (内訳付き)
+    std::wstring detail = L"【オブジェクト基準:絶対フレーム数】\nコピー結果: " + text +
+        L"\n\n[内訳: カットされた前半 + 相対フレーム]\n・カットされた前半のフレーム = " + std::to_wstring(cutFramesInt) + L" (再生位置: " + FormatSecondsValue(sinfo.play_position, 3, false) + L"s)" +
+        L"\n・オブジェクト基準(カット後)のフレーム = " + std::to_wstring(relFrameDisplay) +
+        L"\n・合計 (絶対フレーム数) = " + text;
+    NotifyCopyResult(L"【オブジェクト基準:絶対フレーム数】", (g_config.notify_mode == 1) ? detail : text);
+}
+
+// 9. オブジェクト基準: 絶対秒数
+// 定義: 「オブジェクト基準: 相対秒数」 + 再生位置の開始の秒数
+// AviUtl2の「再生位置」は秒数(小数第3位まで)そのもの
+static void OnCopyObjectAbsoluteSeconds(EDIT_SECTION* edit) {
+    if (!edit || !edit->info || edit->info->rate <= 0) return;
+    OBJECT_HANDLE obj = ResolveTargetObject(edit);
+    if (!obj) {
+        HWND parent = GetHostAppWindowSafe();
+        MessageBoxW(parent, L"対象のオブジェクトが見つかりませんでした。\nオブジェクトをクリックまたは選択して実行してください。", L"TimeAcquisition", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    OBJECT_LAYER_FRAME lf = edit->get_object_layer_frame(obj);
+    int relFrame0Based = edit->info->frame - lf.start;
+    double fps = static_cast<double>(edit->info->rate) / static_cast<double>(edit->info->scale);
+    ObjectSourceInfo sinfo = ResolveObjectSourceInfo(edit, obj);
+
+    // 1. オブジェクト基準: 相対秒数 (カット後のオブジェクト先頭からの経過秒数)
+    double speed = (sinfo.play_speed != 0.0) ? (sinfo.play_speed / 100.0) : 1.0;
+    double progressInB = static_cast<double>(relFrame0Based) * speed;
+    double relSec = progressInB / fps;
+
+    // 2. 再生位置の開始の秒数 (再生位置トラックバーに表示されている秒数そのもの)
+    double startSec = (sinfo.has_source_pos) ? sinfo.play_position : 0.0;
+
+    // 3. オブジェクト基準: 絶対秒数 = (相対秒数) + (再生位置の開始の秒数)
+    double absSec = relSec + startSec;
+
+    std::wstring text = FormatSecondsValue(absSec, g_config.sec_precision, g_config.sec_with_unit);
+    CopyToClipboard(text);
+
+    // 通知メッセージ (要望通りの内訳付き)
+    std::wstring relSecStr = FormatSecondsValue(relSec, g_config.sec_precision, g_config.sec_with_unit);
+    std::wstring startSecStr = FormatSecondsValue(startSec, g_config.sec_precision, g_config.sec_with_unit);
+    std::wstring detail = L"【オブジェクト基準:絶対秒数】\nコピー結果: " + text +
+        L"\n\n[内訳: 相対秒数 + 再生開始秒数]\n・オブジェクト基準: 相対秒数 = " + relSecStr +
+        L"\n・再生位置の開始の秒数 = " + startSecStr +
+        L"\n・合計 (相対秒数 + 開始秒数) = " + text;
+    NotifyCopyResult(L"【オブジェクト基準:絶対秒数】", (g_config.notify_mode == 1) ? detail : text);
+}
+
+// 10. オブジェクト：長さ(絶対フレーム数) (カット前の元素材全体の総フレーム数)
+// 例: 素材A(512f)の前半310fカットでB(202f)の場合 -> 元の総フレーム数 512 を取得
+static void OnCopyObjectAbsoluteLengthFrame(EDIT_SECTION* edit) {
+    if (!edit || !edit->info || edit->info->rate <= 0) return;
+    OBJECT_HANDLE obj = ResolveTargetObject(edit);
+    if (!obj) {
+        HWND parent = GetHostAppWindowSafe();
+        MessageBoxW(parent, L"対象のオブジェクトが見つかりませんでした。\nオブジェクトをクリックまたは選択して実行してください。", L"TimeAcquisition", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    OBJECT_LAYER_FRAME lf = edit->get_object_layer_frame(obj);
+    double fps = static_cast<double>(edit->info->rate) / static_cast<double>(edit->info->scale);
+    ObjectSourceInfo sinfo = ResolveObjectSourceInfo(edit, obj);
+
+    int totalFrames = 0;
+    if (sinfo.total_frames > 0) {
+        // メディアファイルのメタデータから直接取得できた場合 (512フレーム)
+        totalFrames = sinfo.total_frames;
+    } else {
+        // メディア情報が取れなくても、カットされた前半(再生位置秒数*FPS) + 残った後半の長さから元素材の長さを復元 (310 + 202 = 512)
+        int cutFramesInt = static_cast<int>(std::round(sinfo.play_position * fps));
+        int currentLength = lf.end - lf.start + 1;
+        totalFrames = cutFramesInt + currentLength;
+    }
+
+    std::wstring text = std::to_wstring(totalFrames);
+    CopyToClipboard(text);
+    NotifyCopyResult(L"【オブジェクト：長さ(絶対フレーム数)】", text);
+}
+
+// 11. オブジェクト：長さ(絶対秒数) (カット前の元素材全体の総秒数)
+static void OnCopyObjectAbsoluteLengthSeconds(EDIT_SECTION* edit) {
+    if (!edit || !edit->info || edit->info->rate <= 0) return;
+    OBJECT_HANDLE obj = ResolveTargetObject(edit);
+    if (!obj) {
+        HWND parent = GetHostAppWindowSafe();
+        MessageBoxW(parent, L"対象のオブジェクトが見つかりませんでした。\nオブジェクトをクリックまたは選択して実行してください。", L"TimeAcquisition", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    OBJECT_LAYER_FRAME lf = edit->get_object_layer_frame(obj);
+    double fps = static_cast<double>(edit->info->rate) / static_cast<double>(edit->info->scale);
+    ObjectSourceInfo sinfo = ResolveObjectSourceInfo(edit, obj);
+
+    double totalSec = 0.0;
+    if (sinfo.total_time > 0.0) {
+        totalSec = sinfo.total_time;
+    } else {
+        double currentLengthSec = static_cast<double>(lf.end - lf.start + 1) / fps;
+        totalSec = sinfo.play_position + currentLengthSec;
+    }
+
+    std::wstring text = FormatSecondsValue(totalSec, g_config.sec_precision, g_config.sec_with_unit);
+    CopyToClipboard(text);
+    NotifyCopyResult(L"【オブジェクト：長さ(絶対秒数)】", text);
+}
+
+//---------------------------------------------------------------------
 // 設定ダイアログ GUI 実装 (Win32 API)
 //---------------------------------------------------------------------
 static const wchar_t* CONFIG_CLASS_NAME = L"AviUtl2_TimeAcquisition_ConfigClass";
@@ -554,8 +875,12 @@ EXPORT void RegisterPlugin(HOST_APP_TABLE* host) {
         host->register_object_menu(L"位置・時間コピー\\タイムライン全体: タイムコード", OnCopyTimelineTimeCode);
         host->register_object_menu(L"位置・時間コピー\\オブジェクト基準: 相対フレーム数", OnCopyObjectRelativeFrame);
         host->register_object_menu(L"位置・時間コピー\\オブジェクト基準: 相対秒数", OnCopyObjectRelativeSeconds);
+        host->register_object_menu(L"位置・時間コピー\\オブジェクト基準: 絶対フレーム数", OnCopyObjectAbsoluteFrame);
+        host->register_object_menu(L"位置・時間コピー\\オブジェクト基準: 絶対秒数", OnCopyObjectAbsoluteSeconds);
         host->register_object_menu(L"位置・時間コピー\\オブジェクト: 長さ(フレーム数)", OnCopyObjectLengthFrame);
         host->register_object_menu(L"位置・時間コピー\\オブジェクト: 長さ(秒数)", OnCopyObjectLengthSeconds);
+        host->register_object_menu(L"位置・時間コピー\\オブジェクト：長さ(絶対フレーム数)", OnCopyObjectAbsoluteLengthFrame);
+        host->register_object_menu(L"位置・時間コピー\\オブジェクト：長さ(絶対秒数)", OnCopyObjectAbsoluteLengthSeconds);
     }
     // 設定メニューは非編集セクションで登録 (排他ロック状態でダイアログを開かないようにするため)
     if (host->register_object_menu_param) {
@@ -569,6 +894,10 @@ EXPORT void RegisterPlugin(HOST_APP_TABLE* host) {
         host->register_layer_menu(L"位置・時間コピー\\タイムライン全体: タイムコード", OnCopyTimelineTimeCode);
         host->register_layer_menu(L"位置・時間コピー\\カーソル下オブジェクト: 相対フレーム数", OnCopyObjectRelativeFrame);
         host->register_layer_menu(L"位置・時間コピー\\カーソル下オブジェクト: 相対秒数", OnCopyObjectRelativeSeconds);
+        host->register_layer_menu(L"位置・時間コピー\\カーソル下オブジェクト: 絶対フレーム数", OnCopyObjectAbsoluteFrame);
+        host->register_layer_menu(L"位置・時間コピー\\カーソル下オブジェクト: 絶対秒数", OnCopyObjectAbsoluteSeconds);
+        host->register_layer_menu(L"位置・時間コピー\\カーソル下オブジェクト: 長さ(絶対フレーム数)", OnCopyObjectAbsoluteLengthFrame);
+        host->register_layer_menu(L"位置・時間コピー\\カーソル下オブジェクト: 長さ(絶対秒数)", OnCopyObjectAbsoluteLengthSeconds);
     }
     if (host->register_layer_menu_param) {
         host->register_layer_menu_param(L"位置・時間コピー\\設定...", nullptr, OnOpenConfigNoEditSection);
@@ -581,6 +910,12 @@ EXPORT void RegisterPlugin(HOST_APP_TABLE* host) {
         host->register_edit_menu(L"位置・時間コピー\\タイムライン全体: タイムコード", OnCopyTimelineTimeCode);
         host->register_edit_menu(L"位置・時間コピー\\オブジェクト基準: 相対フレーム数", OnCopyObjectRelativeFrame);
         host->register_edit_menu(L"位置・時間コピー\\オブジェクト基準: 相対秒数", OnCopyObjectRelativeSeconds);
+        host->register_edit_menu(L"位置・時間コピー\\オブジェクト基準: 絶対フレーム数", OnCopyObjectAbsoluteFrame);
+        host->register_edit_menu(L"位置・時間コピー\\オブジェクト基準: 絶対秒数", OnCopyObjectAbsoluteSeconds);
+        host->register_edit_menu(L"位置・時間コピー\\オブジェクト: 長さ(フレーム数)", OnCopyObjectLengthFrame);
+        host->register_edit_menu(L"位置・時間コピー\\オブジェクト: 長さ(秒数)", OnCopyObjectLengthSeconds);
+        host->register_edit_menu(L"位置・時間コピー\\オブジェクト：長さ(絶対フレーム数)", OnCopyObjectAbsoluteLengthFrame);
+        host->register_edit_menu(L"位置・時間コピー\\オブジェクト：長さ(絶対秒数)", OnCopyObjectAbsoluteLengthSeconds);
     }
     if (host->register_edit_menu_param) {
         host->register_edit_menu_param(L"位置・時間コピー\\設定...", nullptr, OnOpenConfigNoEditSection);
